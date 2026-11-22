@@ -368,11 +368,12 @@ helm:
         fi
       ) &
       exec /init
+  # Prosody answers /health only on localhost, so the image's own script checks it from inside the container.
   - name: additionalContainers.prosody.readinessProbe
     value:
-      httpGet:
-        path: /health
-        port: 5280
+      exec:
+        command:
+        - /usr/local/bin/healthcheck.sh
       periodSeconds: 10
       timeoutSeconds: 5
   # Advertises the address browsers send media to: the media IP setting, or the address the app's domain points to,
