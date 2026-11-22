@@ -1,0 +1,404 @@
+name: jitsi
+icon: jitsi
+type: service
+title: Jitsi Meet
+guidance: GUIDANCE.md
+# One video bridge carries every call through the single published media port, and the XMPP server keeps rooms in
+# memory, so the four components run together in one pod.
+scalable: false
+
+options:
+- version: '2'
+  tag: stable-11509-1
+  default: true
+
+labels:
+- jitsi
+- video-conferencing
+
+deployment:
+  strategy: rolling
+  shutdownGracePeriod: 30s
+
+endpoints:
+- name: jitsi
+  ports:
+  - name: http
+    number: 8000
+    protocol: http
+    main: true
+    routeDefaults:
+      https_redirect: 'true'
+      # Browsers keep the XMPP WebSocket (/xmpp-websocket) open for the whole call.
+      request_timeout: 0s
+      backend_request_timeout: 0s
+  # Audio and video. Publish this port: browsers send media to it over UDP.
+  - name: media
+    number: 10000
+    protocol: udp
+
+tokens:
+- name: jicofo_password
+  generate:
+    regex: '[0-9A-Za-z]{32}'
+- name: jvb_password
+  generate:
+    regex: '[0-9A-Za-z]{32}'
+
+settings:
+# The account that opens rooms. The XMPP server keeps no accounts between restarts; this one is created on every start,
+# so changing the password here and redeploying is how it is changed.
+- name: moderator-username
+  title: Moderator username
+  description: Username that signs in to start meetings. Lowercase letters, digits, dots, dashes and underscores.
+  default: moderator
+  var: JITSI_MODERATOR_USERNAME
+- name: moderator-password
+  title: Moderator password
+  description: Password of the moderator account. Applied on every start; change it here and redeploy.
+  required: true
+  secret: true
+  var: JITSI_MODERATOR_PASSWORD
+- name: allow-guests
+  title: Allow guests
+  description: 1 lets anyone with the link join a meeting once a moderator has started it. 0 requires everyone to sign in.
+  default: '1'
+  var: ENABLE_GUESTS
+- name: media-ip
+  title: Media IP address
+  description: Public IPv4 address browsers send audio and video to. Leave empty to use the address the app's domain points to; set it when the domain goes through a proxy such as Cloudflare.
+  var: JITSI_MEDIA_IP
+
+workloads:
+- name: main
+  kind: statefulset
+  primary: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+  helm:
+    labels: commonLabels
+    annotations: commonAnnotations
+    volumes: extraVolumes
+    sidecars: extraContainers
+  containers:
+  # The web app: Jitsi Meet's pages and the XMPP WebSocket proxy.
+  - name: web
+    image: ghcr.io/jitsi/web
+    env:
+    - name: PUBLIC_URL
+      value: '{{service.primaryURL}}'
+    - name: XMPP_SERVER
+      value: localhost
+    - name: XMPP_BOSH_URL_BASE
+      value: http://localhost:5280
+    - name: ENABLE_AUTH
+      value: '1'
+    - name: AUTH_TYPE
+      value: internal
+    - name: DISABLE_HTTPS
+      value: '1'
+    - name: ENABLE_HTTP_REDIRECT
+      value: '0'
+    - name: ENABLE_LETSENCRYPT
+      value: '0'
+    - name: TZ
+      value: UTC
+    resources:
+      request:
+        cpu: 10
+        memory: 32
+      limit:
+        cpu: 500
+        memory: 256
+    helm:
+      env: envVars
+      resources: resources
+      image:
+        registry: image.registry
+        repository: image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+  # Prosody, the XMPP server that holds rooms and accounts.
+  - name: prosody
+    image: ghcr.io/jitsi/prosody
+    env:
+    - name: PUBLIC_URL
+      value: '{{service.primaryURL}}'
+    - name: ENABLE_AUTH
+      value: '1'
+    - name: AUTH_TYPE
+      value: internal
+    - name: ENABLE_GUESTS
+      value: '{{settings.allow-guests}}'
+    - name: JICOFO_AUTH_PASSWORD
+      value: '{{tokens.jicofo_password}}'
+      secret: true
+    - name: JVB_AUTH_PASSWORD
+      value: '{{tokens.jvb_password}}'
+      secret: true
+    - name: JITSI_MODERATOR_USERNAME
+      value: '{{settings.moderator-username}}'
+    - name: JITSI_MODERATOR_PASSWORD
+      value: '{{settings.moderator-password}}'
+      secret: true
+    - name: TZ
+      value: UTC
+    resources:
+      request:
+        cpu: 10
+        memory: 64
+      limit:
+        cpu: 500
+        memory: 256
+    helm:
+      env: additionalContainers.prosody.envVars
+      resources: additionalContainers.prosody.resources
+      image:
+        registry: additionalContainers.prosody.image.registry
+        repository: additionalContainers.prosody.image.repository
+        tag: additionalContainers.prosody.image.tag
+        pullPolicy: additionalContainers.prosody.image.pullPolicy
+  # Jicofo, the conference focus that puts participants on the video bridge.
+  - name: jicofo
+    image: ghcr.io/jitsi/jicofo
+    env:
+    - name: XMPP_SERVER
+      value: localhost
+    - name: ENABLE_AUTH
+      value: '1'
+    - name: AUTH_TYPE
+      value: internal
+    - name: JICOFO_AUTH_PASSWORD
+      value: '{{tokens.jicofo_password}}'
+      secret: true
+    - name: JICOFO_MAX_MEMORY
+      value: 384m
+    - name: TZ
+      value: UTC
+    resources:
+      request:
+        cpu: 20
+        memory: 192
+      limit:
+        cpu: 1000
+        memory: 640
+    helm:
+      env: additionalContainers.jicofo.envVars
+      resources: additionalContainers.jicofo.resources
+      image:
+        registry: additionalContainers.jicofo.image.registry
+        repository: additionalContainers.jicofo.image.repository
+        tag: additionalContainers.jicofo.image.tag
+        pullPolicy: additionalContainers.jicofo.image.pullPolicy
+  # The video bridge that relays every participant's audio and video.
+  - name: jvb
+    image: ghcr.io/jitsi/jvb
+    env:
+    - name: XMPP_SERVER
+      value: localhost
+    - name: JVB_AUTH_PASSWORD
+      value: '{{tokens.jvb_password}}'
+      secret: true
+    - name: JVB_PORT
+      value: '10000'
+    # Browsers reach the bridge only at the published address, never the pod's own.
+    - name: JVB_DISABLE_STUN
+      value: '1'
+    - name: JVB_ADVERTISE_PRIVATE_CANDIDATES
+      value: '0'
+    - name: JITSI_MEDIA_HOST
+      value: '{{service.primaryHost}}'
+    - name: JITSI_MEDIA_IP
+      value: '{{settings.media-ip}}'
+    - name: JITSI_MEDIA_PORT
+      value: '{{service.endpoints.jitsi.ports.media.publicPort}}'
+    - name: VIDEOBRIDGE_MAX_MEMORY
+      value: 1024m
+    - name: TZ
+      value: UTC
+    resources:
+      request:
+        cpu: 100
+        memory: 512
+      limit:
+        cpu: 2000
+        memory: 1536
+    helm:
+      env: additionalContainers.jvb.envVars
+      resources: additionalContainers.jvb.resources
+      image:
+        registry: additionalContainers.jvb.image.registry
+        repository: additionalContainers.jvb.image.repository
+        tag: additionalContainers.jvb.image.tag
+        pullPolicy: additionalContainers.jvb.image.pullPolicy
+
+helm:
+  name: wodby
+  source: oci://registry-1.docker.io/wodby/stateful
+  chart: oci://registry-1.docker.io/wodby/stateful
+  version: 0.4.0
+  valueMappings:
+    replicas: replicaCount
+    nameOverride: nameOverride
+    fullnameOverride: fullnameOverride
+    serviceAccountName: serviceAccount.name
+    serviceAccountCreate: serviceAccount.create
+    strategy: updateStrategy
+    minReady: minReadySeconds
+    shutdownGracePeriod: terminationGracePeriodSeconds
+  values:
+  - name: containerName
+    value: web
+  # The media port belongs to the video bridge; the pod's containers share one network, so the Service reaches it
+  # through this entry.
+  - name: containerPorts
+    value:
+    - name: http
+      containerPort: 8000
+      protocol: TCP
+    - name: media
+      containerPort: 10000
+      protocol: UDP
+  - name: podSecurityContext
+    value:
+      fsGroup: 1000
+      fsGroupChangePolicy: OnRootMismatch
+  - name: securityContext
+    value:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      runAsGroup: 1000
+      runAsNonRoot: true
+      runAsUser: 1000
+  # The images keep their process supervisor's state in /run and scratch files in /tmp, which upstream mounts as
+  # small in-memory volumes. Each container gets its own.
+  - name: extraVolumes
+    value:
+    - name: web-run
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Mi
+    - name: web-tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi
+    - name: prosody-run
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Mi
+    - name: prosody-tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi
+    - name: jicofo-run
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Mi
+    - name: jicofo-tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi
+    - name: jvb-run
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Mi
+    - name: jvb-tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Mi
+  - name: extraVolumeMounts
+    value:
+    - name: web-run
+      mountPath: /run
+    - name: web-tmp
+      mountPath: /tmp
+  - name: additionalContainers.prosody.extraVolumeMounts
+    value:
+    - name: prosody-run
+      mountPath: /run
+    - name: prosody-tmp
+      mountPath: /tmp
+  - name: additionalContainers.jicofo.extraVolumeMounts
+    value:
+    - name: jicofo-run
+      mountPath: /run
+    - name: jicofo-tmp
+      mountPath: /tmp
+  - name: additionalContainers.jvb.extraVolumeMounts
+    value:
+    - name: jvb-run
+      mountPath: /run
+    - name: jvb-tmp
+      mountPath: /tmp
+  - name: startupProbe
+    value:
+      tcpSocket:
+        port: http
+      failureThreshold: 60
+      periodSeconds: 2
+  - name: readinessProbe
+    value:
+      httpGet:
+        path: /
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 5
+  # Creates the moderator account once Prosody answers. Accounts live in the container, so this runs on every start.
+  - name: additionalContainers.prosody.command
+    value:
+    - /bin/bash
+    - -c
+    - |
+      (
+        for _ in $(seq 1 90); do
+          curl -fs -o /dev/null http://127.0.0.1:5280/health && break
+          sleep 2
+        done
+        cfg=/run/prosody/config/prosody.cfg.lua
+        jid="${JITSI_MODERATOR_USERNAME}@${XMPP_DOMAIN:-meet.jitsi}"
+        if out=$(prosodyctl --config "$cfg" shell user create "$jid" "$JITSI_MODERATOR_PASSWORD" 2>&1); then
+          echo "[wodby] Created the moderator account ${JITSI_MODERATOR_USERNAME}"
+        elif out=$(prosodyctl --config "$cfg" shell user password "$jid" "$JITSI_MODERATOR_PASSWORD" 2>&1); then
+          echo "[wodby] Set the moderator account's password"
+        else
+          echo "[wodby] ERROR: couldn't create the moderator account ${JITSI_MODERATOR_USERNAME}: ${out}"
+        fi
+      ) &
+      exec /init
+  - name: additionalContainers.prosody.readinessProbe
+    value:
+      httpGet:
+        path: /health
+        port: 5280
+      periodSeconds: 10
+      timeoutSeconds: 5
+  # Advertises the address browsers send media to: the media IP setting, or the address the app's domain points to,
+  # with the published port.
+  - name: additionalContainers.jvb.command
+    value:
+    - /bin/bash
+    - -c
+    - |
+      ip="${JITSI_MEDIA_IP}"
+      if [ -z "$ip" ]; then
+        ip=$(getent ahostsv4 "$JITSI_MEDIA_HOST" | awk 'NR == 1 { print $1 }')
+      fi
+      if [ -n "$ip" ] && [ -n "$JITSI_MEDIA_PORT" ]; then
+        export JVB_ADVERTISE_IPS="${ip}#${JITSI_MEDIA_PORT}"
+        echo "[wodby] Browsers send audio and video to ${ip}:${JITSI_MEDIA_PORT} over UDP"
+      elif [ -z "$JITSI_MEDIA_PORT" ]; then
+        echo "[wodby] WARNING: the media port isn't published, so calls carry no audio or video. Publish it and redeploy."
+      else
+        echo "[wodby] WARNING: ${JITSI_MEDIA_HOST} doesn't resolve to an IPv4 address; set the Media IP address setting."
+      fi
+      exec /init
+  - name: additionalContainers.jvb.readinessProbe
+    value:
+      httpGet:
+        path: /about/health
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 5
